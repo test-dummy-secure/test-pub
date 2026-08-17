@@ -1,129 +1,237 @@
-# .github/workflows/sast-sca-checks.yml
+# ================================================================
+# Security Checks - SAST + SCA + DefectDojo
+# ================================================================
 #
-# Security pipeline:
-#   SAST -> Semgrep
-#   SCA  -> OSV-Scanner
-#   Results -> DefectDojo
+# PHASE 1 PILOT:
+#   - SAST: Semgrep
+#   - SCA: OSV-Scanner
+#   - Results uploaded to DefectDojo
+#
+# GitHub Repository:
+#   .github/workflows/sast-sca-checks.yml
 #
 # GitHub Actions Variables:
+#
 #   REPORT_ONLY=true
+#       Security checks run but do not block the workflow.
+#
+#   REPORT_ONLY=false
+#       Security checks can block the workflow when configured
+#       blocking conditions are detected.
+#
 #   SEND_TO_DEFECTDOJO=true
+#       Upload SAST/SCA reports to DefectDojo.
 #
 # GitHub Actions Secrets:
+#
 #   DEFECTDOJO_URL
+#       Example:
+#       http://203.145.168.114:6323
+#
 #   DEFECTDOJO_API_KEY
+#       DefectDojo API token.
+#
+# ================================================================
 
 name: Security Checks (SAST + SCA)
 
+# ----------------------------------------------------------------
+# Workflow triggers
+# ----------------------------------------------------------------
 on:
   pull_request:
+
   schedule:
+    # Every day at 02:00 UTC
     - cron: "0 2 * * *"
+
   workflow_dispatch:
 
+
+# ----------------------------------------------------------------
+# GitHub permissions
+# ----------------------------------------------------------------
 permissions:
   contents: read
 
-env:
-  DEFECTDOJO_PRODUCT_TYPE: "GitHub Repositories"
+
+# ================================================================
+# JOB 1 - SAST
+# ================================================================
+#
+# SAST checks OUR OWN SOURCE CODE for security weaknesses.
+#
+# Tool:
+#   Semgrep
+#
+# Output:
+#   sast-report.json
+#
+# Upload:
+#   DefectDojo
+#
+# ================================================================
 
 jobs:
 
-  # ================================================================
-  # SAST
-  # ================================================================
   sast:
+
     name: SAST (code check)
+
     runs-on: ubuntu-latest
 
-    container:
-      image: semgrep/semgrep
+    container: semgrep/semgrep
 
     continue-on-error: ${{ vars.REPORT_ONLY == 'true' }}
 
     steps:
 
       # ------------------------------------------------------------
-      # Checkout
+      # Checkout repository
       # ------------------------------------------------------------
       - name: Checkout repository
+
         uses: actions/checkout@v4
+
         with:
           fetch-depth: 0
 
+
       # ------------------------------------------------------------
-      # Semgrep scan
+      # Run Semgrep
       # ------------------------------------------------------------
-      - name: Run Semgrep SAST scan
+      - name: Scan changed code (PR) or everything (daily)
+
+        shell: bash
+
         run: |
-          echo "Running Semgrep SAST scan..."
+
+          echo "========================================"
+          echo "Starting SAST scan with Semgrep"
+          echo "========================================"
 
           if [ "${{ github.event_name }}" = "pull_request" ]; then
 
+            echo "Pull Request detected."
+            echo "Running diff-aware SAST scan..."
+
             semgrep scan \
               --config p/owasp-top-ten \
-              --baseline-commit "${{ github.event.pull_request.base.sha }}" \
+              --baseline-commit ${{ github.event.pull_request.base.sha }} \
               --severity ERROR \
               --json \
-              --output sast-report.json
+              --output sast-report.json \
+              --error
 
           else
+
+            echo "Running full SAST scan..."
 
             semgrep scan \
               --config p/owasp-top-ten \
               --config p/security-audit \
               --json \
-              --output sast-report.json || true
+              --output sast-report.json \
+              || true
 
           fi
 
-          echo "Checking SAST report..."
+          echo ""
+          echo "SAST scan completed."
 
-          test -f sast-report.json
+          if [ -f sast-report.json ]; then
+            echo "SAST report generated successfully."
+            ls -lh sast-report.json
+          else
+            echo "ERROR: sast-report.json was not generated."
+            exit 1
+          fi
 
-          echo "SAST report generated successfully."
 
       # ------------------------------------------------------------
-      # Upload GitHub artifact
+      # Upload SAST report as GitHub artifact
       # ------------------------------------------------------------
       - name: Keep SAST report
+
         if: always()
+
         uses: actions/upload-artifact@v4
+
         with:
           name: sast-report-${{ github.run_id }}
           path: sast-report.json
           if-no-files-found: warn
-          retention-days: 90
+
 
       # ------------------------------------------------------------
-      # Upload SAST -> DefectDojo
+      # Upload SAST report to DefectDojo
       # ------------------------------------------------------------
       - name: Send SAST report to DefectDojo
-        if: vars.SEND_TO_DEFECTDOJO == 'true'
+
+        if: >
+          always() &&
+          vars.SEND_TO_DEFECTDOJO == 'true' &&
+          hashFiles('sast-report.json') != ''
+
+        shell: bash
+
         run: |
-          echo "Uploading SAST report to DefectDojo..."
+
+          echo "========================================"
+          echo "Uploading SAST report to DefectDojo"
+          echo "========================================"
+
+          echo "DefectDojo URL:"
+          echo "${{ secrets.DEFECTDOJO_URL }}"
 
           curl --fail-with-body \
             -X POST \
-            "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_KEY }}" \
             -F "scan_type=Semgrep JSON Report" \
             -F "file=@sast-report.json" \
-            -F "product_type_name=${{ env.DEFECTDOJO_PRODUCT_TYPE }}" \
             -F "product_name=${{ github.repository }}" \
+            -F "product_type_name=GitHub Repository" \
             -F "engagement_name=SAST" \
-            -F "test_title=Semgrep SAST" \
             -F "auto_create_context=true" \
             -F "close_old_findings=true"
 
+          echo ""
           echo "SAST report successfully uploaded to DefectDojo."
 
 
   # ================================================================
-  # SCA
+  # JOB 2 - SCA
   # ================================================================
+  #
+  # SCA checks THIRD-PARTY DEPENDENCIES for known vulnerabilities.
+  #
+  # Example dependency files:
+  #
+  #   package.json
+  #   package-lock.json
+  #   yarn.lock
+  #   requirements.txt
+  #   poetry.lock
+  #   pyproject.toml
+  #   go.mod
+  #   go.sum
+  #   pom.xml
+  #   build.gradle
+  #   Cargo.lock
+  #
+  # If the repository does not contain supported dependency files:
+  #
+  #   SCA is skipped
+  #
+  # This is NOT a failure.
+  #
+  # ================================================================
+
   sca:
+
     name: SCA (dependency check)
+
     runs-on: ubuntu-latest
 
     continue-on-error: ${{ vars.REPORT_ONLY == 'true' }}
@@ -131,62 +239,174 @@ jobs:
     steps:
 
       # ------------------------------------------------------------
-      # Checkout
+      # Checkout repository
       # ------------------------------------------------------------
       - name: Checkout repository
+
         uses: actions/checkout@v4
 
+
       # ------------------------------------------------------------
-      # Download OSV Scanner
+      # Detect dependency manifests
+      # ------------------------------------------------------------
+      - name: Check for dependency manifests
+
+        id: dependency_check
+
+        shell: bash
+
+        run: |
+
+          echo "========================================"
+          echo "Checking for dependency manifests"
+          echo "========================================"
+
+          FOUND=0
+
+          # Search the repository recursively for supported
+          # dependency files.
+          #
+          # .git directory is excluded.
+
+          while IFS= read -r file; do
+
+            echo "Found dependency file: $file"
+
+            FOUND=1
+
+          done < <(
+            find . \
+              -type f \
+              \( \
+                -name "package.json" \
+                -o -name "package-lock.json" \
+                -o -name "npm-shrinkwrap.json" \
+                -o -name "yarn.lock" \
+                -o -name "pnpm-lock.yaml" \
+                -o -name "requirements.txt" \
+                -o -name "Pipfile.lock" \
+                -o -name "poetry.lock" \
+                -o -name "pyproject.toml" \
+                -o -name "go.mod" \
+                -o -name "go.sum" \
+                -o -name "pom.xml" \
+                -o -name "build.gradle" \
+                -o -name "build.gradle.kts" \
+                -o -name "composer.lock" \
+                -o -name "Gemfile.lock" \
+                -o -name "Cargo.lock" \
+              \) \
+              -not -path "./.git/*"
+          )
+
+          echo ""
+
+          if [ "$FOUND" -eq 1 ]; then
+
+            echo "Dependency files found."
+            echo "SCA scan will run."
+
+            echo "has_dependencies=true" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "No supported dependency manifests found."
+            echo ""
+            echo "This repository does not appear to contain"
+            echo "dependencies that OSV-Scanner can analyze."
+            echo ""
+            echo "SCA scan will be skipped."
+            echo "This is NOT considered a failure."
+
+            echo "has_dependencies=false" >> "$GITHUB_OUTPUT"
+
+          fi
+
+
+      # ------------------------------------------------------------
+      # Download OSV-Scanner
       # ------------------------------------------------------------
       - name: Download OSV-Scanner
+
+        if: steps.dependency_check.outputs.has_dependencies == 'true'
+
+        shell: bash
+
         run: |
+
           echo "Downloading OSV-Scanner..."
 
-          curl -fsSL \
+          curl -sSL \
             https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 \
             -o osv-scanner
 
           chmod +x osv-scanner
 
-          ./osv-scanner --version
+          echo "OSV-Scanner downloaded successfully."
+
+          ./osv-scanner --version || true
+
 
       # ------------------------------------------------------------
-      # Scan dependencies
+      # Run OSV dependency scan
       # ------------------------------------------------------------
       - name: Run OSV dependency scan
+
+        if: steps.dependency_check.outputs.has_dependencies == 'true'
+
+        shell: bash
+
         run: |
-          echo "Running OSV dependency scan..."
+
+          echo "========================================"
+          echo "Running OSV dependency scan"
+          echo "========================================"
 
           ./osv-scanner scan -r . \
             --format json \
-            --output-file sca-report.json || true
+            --output sca-report.json
 
-          echo "Checking SCA report..."
+          echo ""
+          echo "OSV dependency scan completed."
 
-          if [ ! -f sca-report.json ]; then
+          if [ -f sca-report.json ]; then
+
+            echo "SCA report generated successfully."
+
+            ls -lh sca-report.json
+
+          else
+
             echo "ERROR: sca-report.json was not generated."
+
             exit 1
+
           fi
 
-          echo "SCA report generated successfully."
-
-          echo "SCA report size:"
-          wc -c sca-report.json
 
       # ------------------------------------------------------------
-      # Block serious fixable vulnerabilities
-      #
-      # REPORT_ONLY=true:
-      #   Pipeline does not block because of this job's
-      #   continue-on-error setting.
-      #
-      # REPORT_ONLY=false:
-      #   HIGH/CRITICAL fixable vulnerabilities can block.
+      # Check for serious fixable vulnerabilities
       # ------------------------------------------------------------
       - name: Check for serious fixable vulnerabilities
+
+        if: steps.dependency_check.outputs.has_dependencies == 'true'
+
+        shell: bash
+
         run: |
-          echo "Checking SCA results..."
+
+          echo "========================================"
+          echo "Checking for HIGH/CRITICAL vulnerabilities"
+          echo "========================================"
+
+          if [ ! -f sca-report.json ]; then
+
+            echo "ERROR: sca-report.json does not exist."
+
+            exit 1
+
+          fi
+
 
           COUNT=$(jq '
             [
@@ -201,53 +421,95 @@ jobs:
               select(
                 [
                   .affected[]?.ranges[]?.events[]?
-                  |
-                  has("fixed")
+                  | has("fixed")
                 ] | any
               )
             ] | length
           ' sca-report.json 2>/dev/null || echo 0)
 
+
+          echo ""
           echo "Fixable HIGH/CRITICAL dependency vulnerabilities: $COUNT"
+          echo ""
+
 
           if [ "$COUNT" -gt 0 ]; then
-            echo "HIGH/CRITICAL fixable vulnerabilities detected."
-            exit 1
+
+            echo "HIGH/CRITICAL fixable vulnerabilities found."
+
+            if [ "${{ vars.REPORT_ONLY }}" = "true" ]; then
+
+              echo ""
+              echo "REPORT_ONLY=true"
+              echo "Workflow will NOT be blocked."
+
+            else
+
+              echo ""
+              echo "REPORT_ONLY=false"
+              echo "Workflow will be blocked."
+
+              exit 1
+
+            fi
+
+          else
+
+            echo "No fixable HIGH/CRITICAL vulnerabilities found."
+
           fi
 
-          echo "No fixable HIGH/CRITICAL vulnerabilities detected."
 
       # ------------------------------------------------------------
-      # Upload GitHub artifact
+      # Upload SCA report as GitHub artifact
       # ------------------------------------------------------------
       - name: Keep SCA report
-        if: always()
+
+        if: >
+          always() &&
+          steps.dependency_check.outputs.has_dependencies == 'true'
+
         uses: actions/upload-artifact@v4
+
         with:
           name: sca-report-${{ github.run_id }}
           path: sca-report.json
-          if-no-files-found: warn
-          retention-days: 90
+          if-no-files-found: error
+
 
       # ------------------------------------------------------------
-      # Upload SCA -> DefectDojo
+      # Upload SCA report to DefectDojo
       # ------------------------------------------------------------
       - name: Send SCA report to DefectDojo
-        if: vars.SEND_TO_DEFECTDOJO == 'true'
+
+        if: >
+          always() &&
+          steps.dependency_check.outputs.has_dependencies == 'true' &&
+          vars.SEND_TO_DEFECTDOJO == 'true' &&
+          hashFiles('sca-report.json') != ''
+
+        shell: bash
+
         run: |
-          echo "Uploading SCA report to DefectDojo..."
+
+          echo "========================================"
+          echo "Uploading SCA report to DefectDojo"
+          echo "========================================"
+
+          echo "DefectDojo URL:"
+          echo "${{ secrets.DEFECTDOJO_URL }}"
 
           curl --fail-with-body \
             -X POST \
-            "${{ secrets.DEFECTDOJO_URL }}/api/v2/reimport-scan/" \
+            "${{ secrets.DEFECTDOJO_URL }}/api/v2/import-scan/" \
             -H "Authorization: Token ${{ secrets.DEFECTDOJO_API_KEY }}" \
-            -F "scan_type=OSV Scanner" \
+            -F "scan_type=OSV Scan" \
             -F "file=@sca-report.json" \
-            -F "product_type_name=${{ env.DEFECTDOJO_PRODUCT_TYPE }}" \
             -F "product_name=${{ github.repository }}" \
+            -F "product_type_name=GitHub Repository" \
             -F "engagement_name=SCA" \
-            -F "test_title=OSV Dependency Scan" \
             -F "auto_create_context=true" \
             -F "close_old_findings=true"
 
+          echo ""
           echo "SCA report successfully uploaded to DefectDojo."
